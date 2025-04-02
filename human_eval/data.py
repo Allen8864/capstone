@@ -6,9 +6,20 @@ import os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 HUMAN_EVAL = os.path.join(ROOT, "..", "data", "HumanEval.jsonl.gz")
+HUMAN_EVAL_FIX = os.path.join(ROOT, "..", "data", "humaneval-fix-starcoder.jsonl")
 
 
-def read_problems(evalset_file: str = HUMAN_EVAL) -> Dict[str, Dict]:
+def read_problems(evalset_file: str = HUMAN_EVAL, dataset: str = "humaneval") -> Dict[str, Dict]:
+    """
+    读取问题数据集
+    Args:
+        evalset_file: 数据集文件路径
+        dataset: 数据集名称，可选值为 "humaneval" 或 "humanevalfix"
+    Returns:
+        Dict[str, Dict]: 问题字典
+    """
+    if dataset == "humanevalfix":
+        evalset_file = HUMAN_EVAL_FIX
     return {task["task_id"]: task for task in stream_jsonl(evalset_file)}
 
 

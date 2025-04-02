@@ -10,6 +10,7 @@ import datetime
 import os
 import re
 import argparse
+import logging
 from dotenv import load_dotenv
 
 # 加载.env文件中的环境变量
@@ -32,8 +33,48 @@ def parse_args():
                         help='每个问题生成的样本数（默认: 环境变量EVAL_NUM_SAMPLES或1）')
     parser.add_argument('--prompt-level', type=int, default=int(os.environ.get('EVAL_PROMPT_LEVEL', '0')),
                         help='提示级别: 0=原始提示, 1=增强提示（默认: 环境变量EVAL_PROMPT_LEVEL或1）')
+    parser.add_argument('--dataset', type=str, default=os.environ.get('EVAL_DATASET', 'humaneval'),
+                        choices=['humaneval', 'humanevalfix'],
+                        help='数据集选择: humaneval或humanevalfix（默认: 环境变量EVAL_DATASET或humaneval）')
     
     return parser.parse_args()
+
+def setup_logging(log_dir):
+    """
+    设置日志记录
+    Args:
+        log_dir: 日志保存目录
+    """
+    # 确保日志目录存在
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # 设置日志文件路径
+    log_file = os.path.join(log_dir, 'generation.log')
+    
+    # 配置logger
+    # 创建logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    
+    # 创建文件处理器，用于将日志写入文件
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 创建控制台处理器，用于在控制台显示日志
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # 创建格式化器
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # 将处理器添加到logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
 
 def call_ollama_model(prompt, model_name=None, temperature=None, max_tokens=None, top_p=None):
     """
@@ -48,6 +89,8 @@ def call_ollama_model(prompt, model_name=None, temperature=None, max_tokens=None
     Returns:
         tuple: (生成的文本, prompt_tokens, completion_tokens, total_duration)
     """
+    logger = logging.getLogger()
+    
     # 如果参数为None，则使用环境变量中的值
     model_name = model_name or os.environ.get('EVAL_MODEL', 'llama3')
     temperature = temperature if temperature is not None else float(os.environ.get('EVAL_TEMPERATURE', '0.7'))
@@ -83,18 +126,20 @@ def call_ollama_model(prompt, model_name=None, temperature=None, max_tokens=None
         return result.get("response", ""), prompt_tokens, completion_tokens, total_duration
     
     except Exception as e:
-        print(f"调用ollama API时出错: {e}")
+        logger.error(f"调用ollama API时出错: {e}")
         return "", 0, 0, 0
 
-def generate_one_completion(prompt: str, args) -> tuple:
+def generate_one_completion(problem, args) -> tuple:
     """
     实现代码生成逻辑
     Args:
-        prompt: 问题的提示文本
+        problem: 问题字典
         args: 命令行参数
     Returns:
         tuple: (生成的代码补全, prompt_tokens, completion_tokens)
     """
+    logger = logging.getLogger()
+    
     # 为了提高代码生成质量，添加一些提示
     code_instruction = """
 You are a professional Python programming assistant. 
@@ -118,14 +163,22 @@ Here is the function definition:
     # 根据prompt_level决定使用哪种提示
     if args.prompt_level == 0:
         # 使用原始提示
-        enhanced_prompt = prompt
+        enhanced_prompt = problem["prompt"]
         prompt_type = "原始提示"
-    else:
+    elif args.prompt_level == 1:
         # 使用增强提示
-        enhanced_prompt = code_instruction + prompt
+        enhanced_prompt = code_instruction + problem["prompt"]
         prompt_type = "增强提示"
+    elif args.prompt_level == 2:
+        enhanced_prompt = code_instruction + problem["prompt"] + "Here is the test case:\n" + problem["test"]
+        prompt_type = "增强提示+测试用例"
+    elif args.prompt_level == 3:
+        enhanced_prompt = code_instruction + problem["prompt"] + "Here is the canonical solution:\n" + problem["canonical_solution"]
+        prompt_type = "增强提示+标准答案"
     
-    print(f"使用{prompt_type}模式")
+    logger.info(f"使用{prompt_type}模式")
+    logger.info(f"模型: {args.model} \t 温度: {args.temperature} \t 最大token数: {args.max_tokens} \t Top-P值: {args.top_p}")
+    logger.debug(f"提示词: \n {enhanced_prompt} \n #########################################################")
 
     # 调用本地部署的模型
     completion, prompt_tokens, completion_tokens, total_duration = call_ollama_model(
@@ -136,7 +189,7 @@ Here is the function definition:
         top_p=args.top_p
     )
 
-    print(f"模型输出: \n {completion} \n #########################################################")
+    logger.info(f"模型输出: \n {completion} \n #########################################################")
 
     code_block = re.search(r'```([\s\S]+?)```', completion)
       
@@ -147,8 +200,8 @@ Here is the function definition:
     if extracted_code.strip().lower().startswith("python"):
         extracted_code = extracted_code[len("Python"):].strip()
 
-    print(f"提取的代码: \n {extracted_code} \n #########################################################")
-    print(f"Token统计: 提示tokens: {prompt_tokens}, 补全tokens: {completion_tokens}, 总耗时: {total_duration}")
+    logger.info(f"提取的代码: \n {extracted_code} \n #########################################################")
+    logger.info(f"Token统计: 提示tokens: {prompt_tokens}, 补全tokens: {completion_tokens}, 总耗时: {total_duration}")
     
     return extracted_code, prompt_tokens, completion_tokens, total_duration
     
@@ -160,15 +213,54 @@ def main():
     # 解析命令行参数
     args = parse_args()
     
-    # 读取所有问题
-    problems = read_problems()
+    # 读取问题
+    problems = read_problems(dataset=args.dataset)
     
     # 设置每个问题生成多少个样本
     num_samples_per_task = args.num_samples
     
-    print(f"读取了 {len(problems)} 个问题，每个问题生成 {num_samples_per_task} 个样本")
-    print(f"使用模型: {args.model}, 温度: {args.temperature}, 最大token数: {args.max_tokens}, Top-P值: {args.top_p}")
-    print(f"提示级别: {args.prompt_level} ({'原始提示' if args.prompt_level == 0 else '增强提示'})")
+    # 生成时间戳(提前生成，用于设置日志路径)
+    timestamp = start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    
+    # 创建实验目录结构
+    experiments_dir = "experiments"
+    if not os.path.exists(experiments_dir):
+        os.makedirs(experiments_dir)
+    
+    # 创建数据集子目录
+    dataset_dir = os.path.join(experiments_dir, args.dataset)
+    if not os.path.exists(dataset_dir):
+        os.makedirs(dataset_dir)
+    
+    # 创建模型子目录
+    model_dir = os.path.join(dataset_dir, args.model)
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    
+    # 创建prompt level子目录
+    prompt_level_dir = os.path.join(model_dir, f"prompt_level_{args.prompt_level}")
+    if not os.path.exists(prompt_level_dir):
+        os.makedirs(prompt_level_dir)
+    
+    # 创建温度和top_p组合的子目录 - 将小数点替换为下划线
+    temp_str = str(args.temperature).replace('.', '_')
+    top_p_str = str(args.top_p).replace('.', '_')
+    temp_top_p_dir = os.path.join(prompt_level_dir, f"temp_{temp_str}_top_p_{top_p_str}")
+    if not os.path.exists(temp_top_p_dir):
+        os.makedirs(temp_top_p_dir)
+    
+    # 创建时间戳子目录
+    timestamp_dir = os.path.join(temp_top_p_dir, timestamp)
+    if not os.path.exists(timestamp_dir):
+        os.makedirs(timestamp_dir)
+    
+    # 设置日志记录
+    logger = setup_logging(timestamp_dir)
+    
+    logger.info(f"使用数据集: {args.dataset}")
+    logger.info(f"读取了 {len(problems)} 个问题，每个问题生成 {num_samples_per_task} 个样本")
+    logger.info(f"使用模型: {args.model}, 温度: {args.temperature}, 最大token数: {args.max_tokens}, Top-P值: {args.top_p}")
+    logger.info(f"提示级别: {args.prompt_level} ({'原始提示' if args.prompt_level == 0 else '增强提示'})")
     
     # 使用列表来存储生成的样本
     samples = []
@@ -186,7 +278,7 @@ def main():
             for i in range(num_samples_per_task):
                 try:
                     # 生成代码补全
-                    completion, prompt_tokens, completion_tokens, total_duration = generate_one_completion(problem["prompt"], args)
+                    completion, prompt_tokens, completion_tokens, total_duration = generate_one_completion(problem, args)
                     
                     # 添加到样本列表
                     samples.append({
@@ -201,7 +293,7 @@ def main():
                     pbar.update(1)
                     
                 except Exception as e:
-                    print(f"\n处理问题 {task_id} 时出错: {e}")
+                    logger.error(f"\n处理问题 {task_id} 时出错: {e}")
                     # 即使出错也添加一个空的补全，以保持计数一致
                     samples.append({
                         "task_id": task_id,
@@ -226,44 +318,50 @@ def main():
     total_completion_tokens = sum(sample.get("completion_tokens", 0) for sample in samples)
     total_tokens = total_prompt_tokens + total_completion_tokens
     total_duration = sum(sample.get("total_duration", 0) for sample in samples)
-    # 生成时间戳
-    timestamp = end_time.strftime("%Y-%m-%d_%H-%M-%S")
     
     # 设置文件名（不包含时间戳，因为时间戳将用于目录名）
     samples_filename = f"samples.jsonl"
     config_filename = f"config.json"
     
-    # 创建experiments目录（如果不存在）
-    experiments_dir = "experiments"
-    if not os.path.exists(experiments_dir):
-        os.makedirs(experiments_dir)
-    
-    # 创建模型子目录（如果不存在）
-    model_dir = os.path.join(experiments_dir, args.model)
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir)
-    
-    # 创建时间戳子目录
-    timestamp_dir = os.path.join(model_dir, timestamp)
-    if not os.path.exists(timestamp_dir):
-        os.makedirs(timestamp_dir)
-    
     # 完整的输出路径
     samples_path = os.path.join(timestamp_dir, samples_filename)
     
     # 保存生成的样本
-    print(f"\n共生成 {len(samples)} 个样本，正在保存到 {samples_path}...")
+    logger.info(f"\n共生成 {len(samples)} 个样本，正在保存到 {samples_path}...")
     write_jsonl(samples_path, samples)
     
+    # 添加代码，自动执行evaluate_functional_correctness命令
+    logger.info(f"自动执行功能正确性评估...")
+    try:
+        from human_eval.evaluate_functional_correctness import entry_point as evaluate_entry_point
+        logger.info(f"正在评估样本: {samples_path}")
+        # 调用evaluate_functional_correctness的entry_point函数
+        evaluate_entry_point(samples_path)
+        logger.info(f"评估完成!")
+    except Exception as e:
+        logger.error(f"执行评估时出错: {e}")
+        
     # 保存配置信息
     config = {
         "model": args.model,
+        "dataset": args.dataset,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
+        "top_p": args.top_p,
         "num_samples": args.num_samples,
         "prompt_level": args.prompt_level,
-        "prompt_type": "原始提示" if args.prompt_level == 0 else "增强提示",
+        "prompt_type": "原始提示" if args.prompt_level == 0 else ("增强提示" if args.prompt_level == 1 else ("增强提示+测试用例" if args.prompt_level == 2 else "增强提示+标准答案")),
         "timestamp": timestamp,
+        "paths": {
+            "dataset_dir": dataset_dir,
+            "model_dir": model_dir,
+            "prompt_level_dir": prompt_level_dir,
+            "temp_top_p_dir": temp_top_p_dir,
+            "timestamp_dir": timestamp_dir,
+            "experiments_dir": experiments_dir,
+            "samples_path": samples_path,
+            "config_path": os.path.join(timestamp_dir, config_filename)
+        },
         "total_duration": total_duration,
         "total_problems": len(problems),
         "total_samples": len(samples),
@@ -289,20 +387,23 @@ def main():
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     
-    print("样本和配置保存完成!")
-    print(f"实验结果目录: {timestamp_dir}")
-    print(f"模型目录: {model_dir}")
-    print(f"实验根目录: {experiments_dir}")
-    print(f"总运行时间: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
-    print(f"平均每个样本耗时: {round(total_seconds / len(samples), 2) if samples else 0}秒")
-    print(f"Token统计:")
-    print(f"  - 总提示tokens: {total_prompt_tokens}")
-    print(f"  - 总补全tokens: {total_completion_tokens}")
-    print(f"  - 总tokens: {total_tokens}")
-    print(f"  - 平均每样本提示tokens: {round(total_prompt_tokens / len(samples), 2) if samples else 0}")
-    print(f"  - 平均每样本补全tokens: {round(total_completion_tokens / len(samples), 2) if samples else 0}")
-    print(f"要评估生成的样本，请运行以下命令:")
-    print(f"evaluate_functional_correctness {samples_path}")
+    logger.info("样本和配置保存完成!")
+    logger.info(f"实验结果目录: {timestamp_dir}")
+    logger.info(f"温度和top_p组合目录: {temp_top_p_dir}")
+    logger.info(f"提示级别目录: {prompt_level_dir}")
+    logger.info(f"模型目录: {model_dir}")
+    logger.info(f"数据集目录: {dataset_dir}")
+    logger.info(f"实验根目录: {experiments_dir}")
+    logger.info(f"总运行时间: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+    logger.info(f"平均每个样本耗时: {round(total_seconds / len(samples), 2) if samples else 0}秒")
+    logger.info(f"Token统计:")
+    logger.info(f"  - 总提示tokens: {total_prompt_tokens}")
+    logger.info(f"  - 总补全tokens: {total_completion_tokens}")
+    logger.info(f"  - 总tokens: {total_tokens}")
+    logger.info(f"  - 平均每样本提示tokens: {round(total_prompt_tokens / len(samples), 2) if samples else 0}")
+    logger.info(f"  - 平均每样本补全tokens: {round(total_completion_tokens / len(samples), 2) if samples else 0}")
+    logger.info(f"要评估生成的样本，请运行以下命令:")
+    logger.info(f"evaluate_functional_correctness {samples_path}")
 
 if __name__ == "__main__":
     main()
