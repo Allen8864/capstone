@@ -330,17 +330,6 @@ def main():
     logger.info(f"\n共生成 {len(samples)} 个样本，正在保存到 {samples_path}...")
     write_jsonl(samples_path, samples)
     
-    # 添加代码，自动执行evaluate_functional_correctness命令
-    logger.info(f"自动执行功能正确性评估...")
-    try:
-        from human_eval.evaluate_functional_correctness import entry_point as evaluate_entry_point
-        logger.info(f"正在评估样本: {samples_path}")
-        # 调用evaluate_functional_correctness的entry_point函数
-        evaluate_entry_point(samples_path)
-        logger.info(f"评估完成!")
-    except Exception as e:
-        logger.error(f"执行评估时出错: {e}")
-        
     # 保存配置信息
     config = {
         "model": args.model,
@@ -402,6 +391,30 @@ def main():
     logger.info(f"  - 总tokens: {total_tokens}")
     logger.info(f"  - 平均每样本提示tokens: {round(total_prompt_tokens / len(samples), 2) if samples else 0}")
     logger.info(f"  - 平均每样本补全tokens: {round(total_completion_tokens / len(samples), 2) if samples else 0}")
+    
+     # 添加代码，自动执行evaluate_functional_correctness命令
+    logger.info(f"自动执行功能正确性评估...")
+    try:
+        import subprocess
+        logger.info(f"正在评估样本: {samples_path}")
+        # 使用subprocess调用evaluate_functional_correctness命令
+        eval_cmd = ["evaluate_functional_correctness", samples_path]
+        logger.info(f"执行命令: {' '.join(eval_cmd)}")
+        eval_process = subprocess.Popen(eval_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        
+        # 实时输出评估过程
+        for line in iter(eval_process.stdout.readline, ''):
+            logger.info(line.strip())
+        
+        eval_process.stdout.close()
+        return_code = eval_process.wait()
+        
+        if return_code == 0:
+            logger.info(f"评估完成，返回状态码: {return_code}")
+        else:
+            logger.error(f"评估失败，返回状态码: {return_code}")
+    except Exception as e:
+        logger.error(f"执行评估时出错: {e}")
     logger.info(f"要评估生成的样本，请运行以下命令:")
     logger.info(f"evaluate_functional_correctness {samples_path}")
 
